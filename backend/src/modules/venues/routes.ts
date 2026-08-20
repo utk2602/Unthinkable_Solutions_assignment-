@@ -38,6 +38,14 @@ export const venueRoutes: FastifyPluginAsync = async (app) => {
     return { venue };
   });
 
+  app.patch('/:venueId', async (request, reply) => {
+    const venueId = idSchema.parse((request.params as { venueId: string }).venueId);
+    const input = venueSchema.partial().refine((value) => Object.keys(value).length > 0, 'Provide at least one field.').parse(request.body);
+    const existing = await prisma.venue.findUnique({ where: { id: venueId } });
+    if (!existing) return reply.notFound('Venue not found.');
+    return { venue: await prisma.venue.update({ where: { id: venueId }, data: input }) };
+  });
+
   app.post('/:venueId/categories', async (request, reply) => {
     const venueId = idSchema.parse((request.params as { venueId: string }).venueId);
     const input = categorySchema.parse(request.body);

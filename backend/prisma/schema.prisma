@@ -292,6 +292,8 @@ model Notification {
   subject     String
   body        String
   error       String?
+  attemptCount Int               @default(0)
+  lastAttemptAt DateTime?
   sentAt      DateTime?
   createdAt   DateTime           @default(now())
   user        User               @relation(fields: [userId], references: [id])

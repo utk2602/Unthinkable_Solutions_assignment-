@@ -1,10 +1,10 @@
-import { OfferStatus, Prisma, SeatStatus, WaitlistStatus } from '@prisma/client';
+import { NotificationType, OfferStatus, Prisma, SeatStatus, WaitlistStatus } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
 import { env } from '../../config/env.js';
 
 export async function offerNextWaitlistedCustomer(tx: Prisma.TransactionClient, eventId: string, categoryId: string, showSeatId: string) {
   const entry = await tx.waitlistEntry.findFirst({
-    where: { eventId, categoryId, status: WaitlistStatus.WAITING },
+    where: { eventId, categoryId, status: WaitlistStatus.WAITING, event: { status: 'PUBLISHED', startsAt: { gt: new Date() } } },
     orderBy: { createdAt: 'asc' }
   });
   if (!entry) return null;
@@ -19,9 +19,19 @@ export async function offerNextWaitlistedCustomer(tx: Prisma.TransactionClient, 
       expiresAt,
       seats: { create: { showSeatId } }
     },
-    include: { entry: { include: { user: true } }, seats: { include: { showSeat: true } } }
+    include: { entry: { include: { user: true } }, event: { select: { title: true } }, seats: { include: { showSeat: true } } }
   });
   await tx.showSeat.update({ where: { id: showSeatId }, data: { status: SeatStatus.HELD } });
+  await tx.notification.create({
+    data: {
+      userId: offer.entry.userId,
+      offerId: offer.id,
+      type: NotificationType.WAITLIST_OFFER,
+      recipient: offer.entry.user.email,
+      subject: `A seat is available for ${offer.event.title}`,
+      body: `A seat is available. Complete your booking before ${offer.expiresAt.toISOString()}.`
+    }
+  });
   return offer;
 }
 

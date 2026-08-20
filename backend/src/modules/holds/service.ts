@@ -3,9 +3,11 @@ import { HoldStatus, Prisma, SeatStatus } from '@prisma/client';
 type DbClient = Prisma.TransactionClient;
 
 export async function lockShowSeats(tx: DbClient, seatIds: string[]) {
+  if (!seatIds.length) return;
+  const typedSeatIds = [...seatIds].sort().map((seatId) => Prisma.sql`${seatId}::uuid`);
   await tx.$queryRaw(Prisma.sql`
     SELECT id FROM "ShowSeat"
-    WHERE id IN (${Prisma.join([...seatIds].sort())})
+    WHERE id IN (${Prisma.join(typedSeatIds)})
     ORDER BY id
     FOR UPDATE
   `);

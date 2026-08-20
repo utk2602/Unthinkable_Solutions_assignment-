@@ -26,6 +26,7 @@ export const organiserEventRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/', async (request, reply) => {
     const input = eventInput.parse(request.body);
+    if (input.startsAt <= new Date()) return reply.badRequest('Event start time must be in the future.');
     const venue = await prisma.venue.findUnique({ where: { id: input.venueId }, include: { categories: true } });
     if (!venue) return reply.notFound('Venue not found.');
     const validCategoryIds = new Set(venue.categories.map((category) => category.id));
@@ -59,10 +60,33 @@ export const organiserEventRoutes: FastifyPluginAsync = async (app) => {
     if (!existing) return reply.notFound('Event not found.');
     if (existing.status !== EventStatus.DRAFT) return reply.badRequest('Only draft events may be changed.');
     const input = eventBase.partial().parse(request.body);
-    if (input.startsAt && input.endsAt && input.endsAt <= input.startsAt) return reply.badRequest('End time must be after start time.');
+    const startsAt = input.startsAt ?? existing.startsAt;
+    const endsAt = input.endsAt ?? existing.endsAt;
+    if (startsAt <= new Date()) return reply.badRequest('Event start time must be in the future.');
+    if (endsAt <= startsAt) return reply.badRequest('End time must be after start time.');
+    const venueId = input.venueId ?? existing.venueId;
+    const replacingPrices = Boolean(input.prices || input.venueId);
+    const prices = input.prices ?? (input.venueId ? undefined : existing.categoryPrices.map((price) => ({ categoryId: price.categoryId, price: Number(price.price) })));
+    if (replacingPrices && !prices) return reply.badRequest('Prices are required when changing the venue.');
+    if (replacingPrices && prices) {
+      const venue = await prisma.venue.findUnique({ where: { id: venueId }, include: { categories: true } });
+      if (!venue) return reply.notFound('Venue not found.');
+      const validCategoryIds = new Set(venue.categories.map((category) => category.id));
+      if (new Set(prices.map((price) => price.categoryId)).size !== prices.length || prices.some((price) => !validCategoryIds.has(price.categoryId))) {
+        return reply.badRequest('Every price must reference a unique category from the selected venue.');
+      }
+    }
     const event = await prisma.event.update({
       where: { id: eventId },
-      data: { title: input.title, description: input.description, type: input.type, startsAt: input.startsAt, endsAt: input.endsAt },
+      data: {
+        venueId,
+        title: input.title,
+        description: input.description,
+        type: input.type,
+        startsAt,
+        endsAt,
+        ...(replacingPrices && prices ? { categoryPrices: { deleteMany: {}, create: prices } } : {})
+      },
       include: { venue: true, categoryPrices: { include: { category: true } } }
     });
     return { event };
@@ -73,15 +97,29 @@ export const organiserEventRoutes: FastifyPluginAsync = async (app) => {
     const event = await ownedEvent(eventId, request.user.id);
     if (!event) return reply.notFound('Event not found.');
     if (event.status !== EventStatus.DRAFT) return reply.badRequest('Only draft events may be published.');
+    if (event.startsAt <= new Date()) return reply.badRequest('Past events cannot be published.');
     if (event.venue.seats.length === 0) return reply.badRequest('The venue has no active seats.');
     const priceByCategory = new Map(event.categoryPrices.map((price) => [price.categoryId, price.price]));
     if (event.venue.seats.some((seat) => !priceByCategory.has(seat.categoryId))) return reply.badRequest('Every active venue category needs a price.');
     const published = await prisma.$transaction(async (tx) => {
+      const claimed = await tx.event.updateMany({ where: { id: eventId, organiserId: request.user.id, status: EventStatus.DRAFT }, data: { status: EventStatus.PUBLISHED } });
+      if (!claimed.count) throw app.httpErrors.conflict('Event was already published or changed.');
       await tx.showSeat.createMany({ data: event.venue.seats.map((seat) => ({ eventId, venueSeatId: seat.id, categoryId: seat.categoryId, rowLabel: seat.rowLabel, seatNumber: seat.seatNumber, price: priceByCategory.get(seat.categoryId)! })) });
-      return tx.event.update({ where: { id: eventId }, data: { status: EventStatus.PUBLISHED }, include: { venue: true, categoryPrices: { include: { category: true } } } });
+      return tx.event.findUniqueOrThrow({ where: { id: eventId }, include: { venue: true, categoryPrices: { include: { category: true } } } });
     });
     return { event: published };
   });
+};
+
+export const organiserVenueRoutes: FastifyPluginAsync = async (app) => {
+  app.addHook('preHandler', authenticate);
+  app.addHook('preHandler', requireRole(Role.ORGANISER));
+  app.get('/', async () => ({
+    venues: await prisma.venue.findMany({
+      include: { categories: { orderBy: { sortOrder: 'asc' } }, _count: { select: { seats: true } } },
+      orderBy: [{ city: 'asc' }, { name: 'asc' }]
+    })
+  }));
 };
 
 export const publicEventRoutes: FastifyPluginAsync = async (app) => {

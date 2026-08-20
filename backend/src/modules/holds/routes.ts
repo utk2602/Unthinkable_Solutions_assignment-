@@ -6,6 +6,7 @@ import { authenticate, requireRole } from '../../middleware/auth.js';
 import { prisma } from '../../lib/prisma.js';
 import { lockShowSeats, releaseExpiredHolds } from './service.js';
 import { emitSeatMapChanged } from '../../realtime/index.js';
+import { unavailableSeatIds } from './logic.js';
 
 const idSchema = z.string().uuid();
 const holdInput = z.object({ seatIds: z.array(z.string().uuid()).min(1).max(8) });
@@ -17,7 +18,8 @@ function holdView(hold: { id: string; eventId: string; status: HoldStatus; expir
 export const seatRoutes: FastifyPluginAsync = async (app) => {
   app.get('/events/:eventId/seats', async (request, reply) => {
     const eventId = idSchema.parse((request.params as { eventId: string }).eventId);
-    await prisma.$transaction((tx) => releaseExpiredHolds(tx, eventId), { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    const releasedSeatIds = await prisma.$transaction((tx) => releaseExpiredHolds(tx, eventId), { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    if (releasedSeatIds.length) emitSeatMapChanged(eventId);
     const event = await prisma.event.findFirst({
       where: { id: eventId, status: EventStatus.PUBLISHED },
       include: { showSeats: { include: { category: true }, orderBy: [{ rowLabel: 'asc' }, { seatNumber: 'asc' }] } }
@@ -33,14 +35,13 @@ export const seatRoutes: FastifyPluginAsync = async (app) => {
     const expiresAt = new Date(Date.now() + env.SEAT_HOLD_MINUTES * 60_000);
 
     const result = await prisma.$transaction(async (tx) => {
-      const event = await tx.event.findFirst({ where: { id: eventId, status: EventStatus.PUBLISHED } });
-      if (!event) throw app.httpErrors.notFound('Event not found.');
+      const event = await tx.event.findFirst({ where: { id: eventId, status: EventStatus.PUBLISHED, startsAt: { gt: new Date() } } });
+      if (!event) throw app.httpErrors.notFound('Upcoming event not found.');
       await lockShowSeats(tx, seatIds);
       await releaseExpiredHolds(tx, eventId);
       const seats = await tx.showSeat.findMany({ where: { id: { in: seatIds }, eventId } });
       if (seats.length !== seatIds.length) throw app.httpErrors.badRequest('One or more selected seats do not belong to this event.');
-      const unavailable = seats.filter((seat) => seat.status !== SeatStatus.AVAILABLE);
-      if (unavailable.length) throw app.httpErrors.conflict('One or more selected seats are no longer available.');
+      if (unavailableSeatIds(seats).length) throw app.httpErrors.conflict('One or more selected seats are no longer available.');
       const hold = await tx.hold.create({
         data: { eventId, userId: request.user.id, expiresAt, seats: { create: seatIds.map((showSeatId) => ({ showSeatId })) } },
         include: { seats: { include: { showSeat: { include: { category: true } } } } }
