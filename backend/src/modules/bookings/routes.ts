@@ -7,6 +7,7 @@ import { authenticate, requireRole } from '../../middleware/auth.js';
 import { prisma } from '../../lib/prisma.js';
 import { lockShowSeats, releaseExpiredHolds } from '../holds/service.js';
 import { offerNextWaitlistedCustomer } from '../waitlist/service.js';
+import { emitSeatMapChanged } from '../../realtime/index.js';
 
 const idSchema = z.string().uuid();
 const waitlistInput = z.object({ categoryId: z.string().uuid(), quantity: z.coerce.number().int().min(1).max(8).default(1) });
@@ -57,6 +58,7 @@ export const bookingRoutes: FastifyPluginAsync = async (app) => {
       await tx.hold.update({ where: { id: hold.id }, data: { status: HoldStatus.COMPLETED } });
       return created;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    emitSeatMapChanged(booking.eventId);
     return reply.code(201).send({ booking, qrCode: await QRCode.toDataURL(booking.qrPayload) });
   });
 
@@ -73,7 +75,7 @@ export const bookingRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/bookings/:bookingId/cancel', { preHandler: [authenticate, requireRole(Role.CUSTOMER)] }, async (request, reply) => {
     const bookingId = idSchema.parse((request.params as { bookingId: string }).bookingId);
-    const offers = await prisma.$transaction(async (tx) => {
+    const cancellation = await prisma.$transaction(async (tx) => {
       const booking = await tx.booking.findFirst({ where: { id: bookingId, userId: request.user.id, status: BookingStatus.CONFIRMED }, include: { seats: { include: { showSeat: true } } } });
       if (!booking) throw app.httpErrors.notFound('Confirmed booking not found.');
       await lockShowSeats(tx, booking.seats.map((seat) => seat.showSeatId));
@@ -84,10 +86,14 @@ export const bookingRoutes: FastifyPluginAsync = async (app) => {
         const offer = await offerNextWaitlistedCustomer(tx, booking.eventId, seat.showSeat.categoryId, seat.showSeatId);
         if (offer) generated.push(offer);
       }
+      for (const offer of generated) {
+        await tx.notification.create({ data: { userId: offer.entry.userId, offerId: offer.id, type: NotificationType.WAITLIST_OFFER, recipient: offer.entry.user.email, subject: `A seat is available for ${offer.entry.eventId}`, body: `A seat is available. Complete your booking before ${offer.expiresAt.toISOString()}.` } });
+      }
       await tx.notification.create({ data: { userId: request.user.id, bookingId: booking.id, type: NotificationType.BOOKING_CANCELLATION, recipient: request.user.email, subject: `Booking ${booking.reference} cancelled`, body: 'Your seats were released successfully.' } });
-      return generated;
+      return { eventId: booking.eventId, offers: generated };
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
-    return { cancelled: true, waitlistOffersCreated: offers.length };
+    emitSeatMapChanged(cancellation.eventId);
+    return { cancelled: true, waitlistOffersCreated: cancellation.offers.length };
   });
 
   app.post('/events/:eventId/waitlist', { preHandler: [authenticate, requireRole(Role.CUSTOMER)] }, async (request, reply) => {
@@ -117,7 +123,7 @@ export const bookingRoutes: FastifyPluginAsync = async (app) => {
       await lockShowSeats(tx, offer.seats.map((seat) => seat.showSeatId));
       if (offer.expiresAt <= new Date()) {
         await tx.waitlistOffer.update({ where: { id: offer.id }, data: { status: OfferStatus.EXPIRED } });
-        await tx.waitlistEntry.update({ where: { id: offer.entryId }, data: { status: WaitlistStatus.WAITING } });
+        await tx.waitlistEntry.update({ where: { id: offer.entryId }, data: { status: WaitlistStatus.EXPIRED } });
         await tx.showSeat.updateMany({ where: { id: { in: offer.seats.map((seat) => seat.showSeatId) } }, data: { status: SeatStatus.AVAILABLE } });
         throw app.httpErrors.gone('This waitlist offer has expired.');
       }
@@ -135,6 +141,7 @@ export const bookingRoutes: FastifyPluginAsync = async (app) => {
       await tx.waitlistEntry.update({ where: { id: offer.entryId }, data: { status: WaitlistStatus.FULFILLED } });
       return created;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    emitSeatMapChanged(booking.eventId);
     return reply.code(201).send({ booking, qrCode: await QRCode.toDataURL(booking.qrPayload) });
   });
 };

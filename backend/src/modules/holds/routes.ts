@@ -5,6 +5,7 @@ import { env } from '../../config/env.js';
 import { authenticate, requireRole } from '../../middleware/auth.js';
 import { prisma } from '../../lib/prisma.js';
 import { lockShowSeats, releaseExpiredHolds } from './service.js';
+import { emitSeatMapChanged } from '../../realtime/index.js';
 
 const idSchema = z.string().uuid();
 const holdInput = z.object({ seatIds: z.array(z.string().uuid()).min(1).max(8) });
@@ -47,7 +48,7 @@ export const seatRoutes: FastifyPluginAsync = async (app) => {
       await tx.showSeat.updateMany({ where: { id: { in: seatIds } }, data: { status: SeatStatus.HELD } });
       return hold;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
-
+    emitSeatMapChanged(eventId);
     return reply.code(201).send({ hold: holdView(result) });
   });
 
@@ -60,13 +61,15 @@ export const seatRoutes: FastifyPluginAsync = async (app) => {
 
   app.delete('/holds/:holdId', { preHandler: authenticate }, async (request, reply) => {
     const holdId = idSchema.parse((request.params as { holdId: string }).holdId);
-    await prisma.$transaction(async (tx) => {
+    const eventId = await prisma.$transaction(async (tx) => {
       const hold = await tx.hold.findFirst({ where: { id: holdId, userId: request.user.id, status: HoldStatus.ACTIVE }, include: { seats: true } });
       if (!hold) throw app.httpErrors.notFound('Active hold not found.');
       await lockShowSeats(tx, hold.seats.map((seat) => seat.showSeatId));
       await tx.showSeat.updateMany({ where: { id: { in: hold.seats.map((seat) => seat.showSeatId) }, status: SeatStatus.HELD }, data: { status: SeatStatus.AVAILABLE } });
       await tx.hold.update({ where: { id: hold.id }, data: { status: HoldStatus.RELEASED } });
+      return hold.eventId;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    emitSeatMapChanged(eventId);
     return reply.code(204).send();
   });
 };

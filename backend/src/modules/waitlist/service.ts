@@ -32,7 +32,7 @@ export async function expireWaitlistOffers(tx: Prisma.TransactionClient) {
   });
   for (const offer of offers) {
     await tx.waitlistOffer.update({ where: { id: offer.id }, data: { status: OfferStatus.EXPIRED } });
-    await tx.waitlistEntry.update({ where: { id: offer.entryId }, data: { status: WaitlistStatus.WAITING } });
+    await tx.waitlistEntry.update({ where: { id: offer.entryId }, data: { status: WaitlistStatus.EXPIRED } });
     await tx.showSeat.updateMany({ where: { id: { in: offer.seats.map((seat) => seat.showSeatId) }, status: SeatStatus.HELD }, data: { status: SeatStatus.AVAILABLE } });
   }
   return offers;
