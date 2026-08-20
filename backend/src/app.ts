@@ -6,6 +6,8 @@ import swaggerUi from '@fastify/swagger-ui';
 import Fastify from 'fastify';
 import { env } from './config/env.js';
 import { authRoutes } from './modules/auth/routes.js';
+import { organiserEventRoutes, publicEventRoutes } from './modules/events/routes.js';
+import { venueRoutes } from './modules/venues/routes.js';
 
 export function buildApp() {
   const app = Fastify({ logger: true });
@@ -21,6 +23,9 @@ export function buildApp() {
   });
   app.register(swaggerUi, { routePrefix: '/docs' });
   app.register(authRoutes, { prefix: '/api/v1/auth' });
+  app.register(venueRoutes, { prefix: '/api/v1/admin/venues' });
+  app.register(organiserEventRoutes, { prefix: '/api/v1/organiser/events' });
+  app.register(publicEventRoutes, { prefix: '/api/v1/events' });
 
   app.get('/health', async () => ({ status: 'ok', service: 'ticket-booking-api' }));
   app.setErrorHandler((error, _request, reply) => {

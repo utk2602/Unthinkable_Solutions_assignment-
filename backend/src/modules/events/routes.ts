@@ -1,0 +1,104 @@
+import { EventStatus, EventType, Role } from '@prisma/client';
+import type { FastifyPluginAsync } from 'fastify';
+import { z } from 'zod';
+import { authenticate, requireRole } from '../../middleware/auth.js';
+import { prisma } from '../../lib/prisma.js';
+
+const idSchema = z.string().uuid();
+const eventBase = z.object({
+  venueId: z.string().uuid(),
+  title: z.string().trim().min(2).max(160),
+  description: z.string().trim().max(2000).optional(),
+  type: z.nativeEnum(EventType),
+  startsAt: z.coerce.date(),
+  endsAt: z.coerce.date(),
+  prices: z.array(z.object({ categoryId: z.string().uuid(), price: z.coerce.number().positive().max(1_000_000) })).min(1)
+});
+const eventInput = eventBase.refine((input) => input.endsAt > input.startsAt, { message: 'End time must be after start time.', path: ['endsAt'] });
+
+async function ownedEvent(eventId: string, organiserId: string) {
+  return prisma.event.findFirst({ where: { id: eventId, organiserId }, include: { categoryPrices: true, venue: { include: { seats: { where: { isActive: true } } } } } });
+}
+
+export const organiserEventRoutes: FastifyPluginAsync = async (app) => {
+  app.addHook('preHandler', authenticate);
+  app.addHook('preHandler', requireRole(Role.ORGANISER));
+
+  app.post('/', async (request, reply) => {
+    const input = eventInput.parse(request.body);
+    const venue = await prisma.venue.findUnique({ where: { id: input.venueId }, include: { categories: true } });
+    if (!venue) return reply.notFound('Venue not found.');
+    const validCategoryIds = new Set(venue.categories.map((category) => category.id));
+    const priceCategoryIds = new Set(input.prices.map((price) => price.categoryId));
+    if (priceCategoryIds.size !== input.prices.length || [...priceCategoryIds].some((id) => !validCategoryIds.has(id))) {
+      return reply.badRequest('Provide exactly one valid price for each selected venue category.');
+    }
+    const event = await prisma.event.create({
+      data: {
+        organiserId: request.user.id,
+        venueId: input.venueId,
+        title: input.title,
+        description: input.description,
+        type: input.type,
+        startsAt: input.startsAt,
+        endsAt: input.endsAt,
+        categoryPrices: { create: input.prices }
+      },
+      include: { categoryPrices: { include: { category: true } }, venue: true }
+    });
+    return reply.code(201).send({ event });
+  });
+
+  app.get('/', async (request) => ({
+    events: await prisma.event.findMany({ where: { organiserId: request.user.id }, include: { venue: true, categoryPrices: { include: { category: true } }, _count: { select: { bookings: true } } }, orderBy: { startsAt: 'asc' } })
+  }));
+
+  app.patch('/:eventId', async (request, reply) => {
+    const eventId = idSchema.parse((request.params as { eventId: string }).eventId);
+    const existing = await ownedEvent(eventId, request.user.id);
+    if (!existing) return reply.notFound('Event not found.');
+    if (existing.status !== EventStatus.DRAFT) return reply.badRequest('Only draft events may be changed.');
+    const input = eventBase.partial().parse(request.body);
+    if (input.startsAt && input.endsAt && input.endsAt <= input.startsAt) return reply.badRequest('End time must be after start time.');
+    const event = await prisma.event.update({
+      where: { id: eventId },
+      data: { title: input.title, description: input.description, type: input.type, startsAt: input.startsAt, endsAt: input.endsAt },
+      include: { venue: true, categoryPrices: { include: { category: true } } }
+    });
+    return { event };
+  });
+
+  app.post('/:eventId/publish', async (request, reply) => {
+    const eventId = idSchema.parse((request.params as { eventId: string }).eventId);
+    const event = await ownedEvent(eventId, request.user.id);
+    if (!event) return reply.notFound('Event not found.');
+    if (event.status !== EventStatus.DRAFT) return reply.badRequest('Only draft events may be published.');
+    if (event.venue.seats.length === 0) return reply.badRequest('The venue has no active seats.');
+    const priceByCategory = new Map(event.categoryPrices.map((price) => [price.categoryId, price.price]));
+    if (event.venue.seats.some((seat) => !priceByCategory.has(seat.categoryId))) return reply.badRequest('Every active venue category needs a price.');
+    const published = await prisma.$transaction(async (tx) => {
+      await tx.showSeat.createMany({ data: event.venue.seats.map((seat) => ({ eventId, venueSeatId: seat.id, categoryId: seat.categoryId, rowLabel: seat.rowLabel, seatNumber: seat.seatNumber, price: priceByCategory.get(seat.categoryId)! })) });
+      return tx.event.update({ where: { id: eventId }, data: { status: EventStatus.PUBLISHED }, include: { venue: true, categoryPrices: { include: { category: true } } } });
+    });
+    return { event: published };
+  });
+};
+
+export const publicEventRoutes: FastifyPluginAsync = async (app) => {
+  app.get('/', async (request) => {
+    const query = z.object({ q: z.string().trim().optional(), type: z.nativeEnum(EventType).optional(), city: z.string().trim().optional(), from: z.coerce.date().optional() }).parse(request.query);
+    const events = await prisma.event.findMany({
+      where: { status: EventStatus.PUBLISHED, startsAt: { gte: query.from ?? new Date() }, ...(query.q ? { title: { contains: query.q, mode: 'insensitive' } } : {}), ...(query.type ? { type: query.type } : {}), ...(query.city ? { venue: { city: { equals: query.city, mode: 'insensitive' } } } : {}) },
+      include: { venue: true, categoryPrices: { include: { category: true } }, _count: { select: { showSeats: true, bookings: true } } },
+      orderBy: { startsAt: 'asc' }
+    });
+    return { events };
+  });
+
+  app.get('/:eventId', async (request, reply) => {
+    const eventId = idSchema.parse((request.params as { eventId: string }).eventId);
+    const event = await prisma.event.findFirst({ where: { id: eventId, status: EventStatus.PUBLISHED }, include: { venue: true, categoryPrices: { include: { category: true } }, organiser: { select: { name: true } } } });
+    if (!event) return reply.notFound('Event not found.');
+    return { event };
+  });
+};
