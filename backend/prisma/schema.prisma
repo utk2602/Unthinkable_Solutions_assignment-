@@ -212,6 +212,7 @@ model Booking {
   eventId     String        @db.Uuid
   userId      String        @db.Uuid
   reference   String        @unique
+  idempotencyKey String?    @unique
   status      BookingStatus @default(CONFIRMED)
   totalAmount Decimal       @db.Decimal(10, 2)
   qrPayload   String

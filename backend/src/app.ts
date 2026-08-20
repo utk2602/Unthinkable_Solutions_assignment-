@@ -8,6 +8,7 @@ import { env } from './config/env.js';
 import { authRoutes } from './modules/auth/routes.js';
 import { organiserEventRoutes, publicEventRoutes } from './modules/events/routes.js';
 import { seatRoutes } from './modules/holds/routes.js';
+import { bookingRoutes } from './modules/bookings/routes.js';
 import { venueRoutes } from './modules/venues/routes.js';
 
 export function buildApp() {
@@ -28,6 +29,7 @@ export function buildApp() {
   app.register(organiserEventRoutes, { prefix: '/api/v1/organiser/events' });
   app.register(publicEventRoutes, { prefix: '/api/v1/events' });
   app.register(seatRoutes, { prefix: '/api/v1' });
+  app.register(bookingRoutes, { prefix: '/api/v1' });
 
   app.get('/health', async () => ({ status: 'ok', service: 'ticket-booking-api' }));
   app.setErrorHandler((error, _request, reply) => {
